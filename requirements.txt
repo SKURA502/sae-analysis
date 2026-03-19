@@ -1,0 +1,9 @@
+datasets
+einops
+jaxtyping
+matplotlib
+numpy
+safetensors
+torch
+tqdm
+transformers
