@@ -50,6 +50,18 @@ Together, the input and output perspectives let you triangulate a feature's mean
 
 ---
 
+## Resource Requirements
+
+| Item | Spec |
+|---|---|
+| **Dataset scale** | 1×10⁵ samples × 128 tokens = **1×10⁷ tokens** per run |
+| **GPU** | Single GPU (tested on H200 / A800) |
+| **Total wall time** | ~1.5 hours for a full attribute computation pass |
+
+No multi-GPU setup is required — the entire pipeline fits comfortably on a single high-end GPU in one shot.
+
+---
+
 ## Prerequisites
 
 ### Datasets
@@ -66,7 +78,7 @@ Update the dataset paths at the top of `dataset/load.py` to match your local set
 
 ### Model Weights
 
-Download the target LLM and its corresponding SAE checkpoint locally. For a quick start, use the pre-trained **[Llama-Scope](https://huggingface.co/collections/fnlp/llama-scope-6720c1f8373805041022e1e6)** SAEs, which are already supported out of the box.
+Download the target LLM and its corresponding SAE checkpoint locally. For a quick start, use the pre-trained **[Llama-Scope](https://huggingface.co/OpenMOSS-Team/Llama-Scope)** SAEs, which are already supported out of the box.
 
 ### Python Dependencies
 
