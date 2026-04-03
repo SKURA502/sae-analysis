@@ -40,8 +40,29 @@ def compute_activation_value(
     top_k = sae_base.top_k
     n_feat = sae_base.sae_dim
 
-    llm_dir = os.path.join("./data", model_name)
-    sae_dir = os.path.join(llm_dir, sae_name, f"layer-{layer}")
+    llm_dir = os.path.join("./data", model_name, sae_name)
+    sae_dir = os.path.join(llm_dir, f"layer-{layer}")
+
+    save_dir = os.path.join(sae_dir, "attribute", "activation_value")
+    stats_path = os.path.join(save_dir, "stats.pt")
+
+    if os.path.exists(stats_path):
+        saved = torch.load(stats_path, weights_only=False)
+        val_avg = saved["avg"].numpy()
+        dist_path = os.path.join(save_dir, "distribution_mean.png")
+        plot_1d_distribution_hist(
+            data=val_avg,
+            mask=np.isfinite(val_avg),
+            save_path=dist_path,
+            title="Distribution of per-latent mean activation value",
+            xlabel="Per-latent mean activation value",
+            ylabel="Number of SAE latents",
+            bins=120,
+        )
+        return {
+            "stats_pt": stats_path,
+            "distribution_mean_png": dist_path,
+        }
 
     meta_path = os.path.join(llm_dir, "meta.json")
     if not os.path.exists(meta_path):
@@ -62,7 +83,6 @@ def compute_activation_value(
     idx_mm = np.memmap(idx_path, dtype="int32", mode="r", shape=(n_sample, seq_len, top_k))
     val_mm = np.memmap(val_path, dtype="float32", mode="r", shape=(n_sample, seq_len, top_k))
 
-    save_dir = os.path.join(sae_dir, "attribute", "activation_value")
     os.makedirs(save_dir, exist_ok=True)
 
     bos_id = model_base.tokenizer.bos_token_id

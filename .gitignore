@@ -1,3 +1,6 @@
 data/
 log/
 __pycache__/
+validation/
+main.sh
+run_layers.sh

@@ -101,13 +101,13 @@ def act_add_llama3_weights(model, direction: Float[Tensor, "d_model"], coeff, la
 
 class Llama3Model(ModelBase):
 
-    def _load_model(self, model_path, dtype=torch.bfloat16):
+    def _load_model(self, model_path, dtype=torch.bfloat16, device: str = "cuda:0"):
 
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
             trust_remote_code=True,
-            device_map="auto",
+            device_map=device,
         ).eval()
 
         model.requires_grad_(False) 

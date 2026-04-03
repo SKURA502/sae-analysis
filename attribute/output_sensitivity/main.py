@@ -18,7 +18,7 @@ from utils.paint import plot_1d_distribution_hist
 def compute_output_sensitivity(
     model_base: ModelBase,
     sae_base: SAEBase,
-    chunk_samples: int = 512,
+    chunk_samples: int = 32,
     clip_percentile: Optional[Tuple[float, float]] = (1.0, 99.0),
 ) -> dict:
     """Compute per-latent sensitivity of model output w.r.t. SAE latent pre-activations.
@@ -33,8 +33,25 @@ def compute_output_sensitivity(
     sae_name = sae_base.sae_name
     layer = sae_base.layer
 
-    llm_dir = os.path.join("./data", model_name)
-    sae_dir = os.path.join(llm_dir, sae_name, f"layer-{layer}")
+    llm_dir = os.path.join("./data", model_name, sae_name)
+    sae_dir = os.path.join(llm_dir, f"layer-{layer}")
+
+    save_dir = os.path.join(sae_dir, "attribute", "output_sensitivity")
+    stats_path = os.path.join(save_dir, "sensitivity.pt")
+
+    if os.path.exists(stats_path):
+        saved = torch.load(stats_path, weights_only=False)
+        mean_abs_grad = saved["mean_abs_grad"]
+        out_plot = os.path.join(save_dir, "distribution_mean_abs_grad.png")
+        plot_1d_distribution_hist(
+            data=mean_abs_grad,
+            save_path=out_plot,
+            title="SAE Latent Sensitivity (mean abs grad)",
+            xlabel="Mean abs grad",
+            ylabel="Number of SAE latents",
+            clip_percentile=clip_percentile,
+        )
+        return {"stats_pt": stats_path, "distribution_mean_abs_grad_png": out_plot}
 
     meta_path = os.path.join(llm_dir, "meta.json")
     if not os.path.exists(meta_path):
@@ -62,7 +79,6 @@ def compute_output_sensitivity(
     idx_mm = np.memmap(idx_path, dtype="int32", mode="r", shape=(n_sample, seq_len, top_k))
     val_mm = np.memmap(val_path, dtype="float32", mode="r", shape=(n_sample, seq_len, top_k))
 
-    save_dir = os.path.join(sae_dir, "attribute", "output_sensitivity")
     os.makedirs(save_dir, exist_ok=True)
 
     device = model_base.model.device
@@ -94,7 +110,7 @@ def compute_output_sensitivity(
 
     # SAE encoding weights
     W_enc = sae_base.sae["W_enc"].to(device=device)
-    b_enc = sae_base.sae["b_enc"].to(device=device)
+    b_enc = sae_base.sae["b_enc"].to(device=device) if sae_base.sae["b_enc"] is not None else None
 
     # Iterate over dataset by chunks
     for start in trange(0, n_sample, int(chunk_samples)):
@@ -134,10 +150,15 @@ def compute_output_sensitivity(
             raise RuntimeError("Expected residual input grad to be populated. Did you run with torch.enable_grad()?")
 
         # pre-activation for SAE (before ReLU)
-        preact = torch.einsum("bld,dh->blh", residual_in["value"], W_enc) + b_enc  # (B, L-1, H)
+        # W_enc/b_enc may be on a different device than residual when model is sharded
+        resid_device = residual_in["value"].device
+        W_enc_local = W_enc.to(resid_device)
+        preact = torch.einsum("bld,dh->blh", residual_in["value"], W_enc_local)
+        if b_enc is not None:
+            preact = preact + b_enc.to(resid_device)  # (B, L-1, H)
         active_mask = preact > 0
 
-        grad_latent = torch.einsum("bld,dh->blh", grad_resid, W_enc)  # (B, L-1, H)
+        grad_latent = torch.einsum("bld,dh->blh", grad_resid, W_enc_local)  # (B, L-1, H)
         abs_grad = grad_latent.abs().detach().cpu().float().numpy()
         active_mask_np = active_mask.detach().cpu().numpy()
 
@@ -147,8 +168,11 @@ def compute_output_sensitivity(
         max_abs_grad = np.maximum(max_abs_grad, active_abs_grad.max(axis=(0, 1)))
         count_active += active_mask_np.sum(axis=(0, 1))
 
-        # clear graph to free memory
+        # free GPU tensors explicitly before next iteration
         residual_in["value"].grad = None
+        residual_in.clear()
+        del outputs, logits, loss, grad_resid, preact, active_mask, grad_latent
+        torch.cuda.empty_cache()
 
     hook_handle.remove()
 
@@ -176,8 +200,8 @@ def compute_output_sensitivity(
     return {"stats_pt": stats_path, "distribution_mean_abs_grad_png": out_plot}
 
 
-def run(model_base: ModelBase, sae_base: SAEBase):
-    out = compute_output_sensitivity(model_base=model_base, sae_base=sae_base)
+def run(model_base: ModelBase, sae_base: SAEBase, chunk_samples: int = 32):
+    out = compute_output_sensitivity(model_base=model_base, sae_base=sae_base, chunk_samples=chunk_samples)
     print(f"[output_sensitivity] stats: {out['stats_pt']}")
     print(f"[output_sensitivity] distribution: {out['distribution_mean_abs_grad_png']}")
     return out

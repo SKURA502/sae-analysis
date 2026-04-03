@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import heapq
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -55,9 +54,6 @@ def describe_features(
     sae_base: SAEBase,
     feature_ids: List[int],
     text_k: int = 40,
-    context_window_forward: int = 20,
-    context_window_backward: int = 20,
-    top_grad_k: int = 5,
     chunk_samples: int = 1024,
     data_root: str = "./data",
 ) -> Dict[int, str]:
@@ -65,27 +61,24 @@ def describe_features(
 
     For each feature, produces:
         token.jsonl           - per-token activation counts
-        topk_text.jsonl       - top-k highest-activating text contexts with gradient highlights
+        topk_text.jsonl       - top-k texts ranked by mean activation value across the full text
         decoder_entropy.json  - decoder entropy + top-10 predicted tokens
         feature.json          - summary statistics
 
     Args:
-        model_base:               Loaded model wrapper.
-        sae_base:                 Loaded SAE wrapper.
-        feature_ids:              List of latent indices to describe.
-        text_k:                   Number of top activating positions to include in context.
-        context_window_forward:   Tokens before the activating position to show.
-        context_window_backward:  Tokens after the activating position to show.
-        top_grad_k:               Number of top-gradient tokens to highlight.
-        chunk_samples:            Chunk size when scanning memmap files.
-        data_root:                Root directory containing cached data.
+        model_base:    Loaded model wrapper.
+        sae_base:      Loaded SAE wrapper.
+        feature_ids:   List of latent indices to describe.
+        text_k:        Number of top activating texts to include.
+        chunk_samples: Chunk size when scanning memmap files.
+        data_root:     Root directory containing cached data.
 
     Returns:
         Dict mapping feature_idx -> output directory path.
     """
     tokenizer = model_base.tokenizer
 
-    llm_dir = os.path.join(data_root, model_base.model_name)
+    llm_dir = os.path.join(data_root, model_base.model_name, sae_base.sae_name)
     meta_path = os.path.join(llm_dir, "meta.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -95,7 +88,7 @@ def describe_features(
     top_k = int(sae_base.top_k)
 
     ids_path = os.path.join(llm_dir, "ids.dat")
-    sae_dir = os.path.join(llm_dir, sae_base.sae_name, f"layer-{sae_base.layer}")
+    sae_dir = os.path.join(llm_dir, f"layer-{sae_base.layer}")
     idx_path = os.path.join(sae_dir, "sae_topk_idx.dat")
     vals_path = os.path.join(sae_dir, "sae_topk_val.dat")
 
@@ -103,8 +96,10 @@ def describe_features(
     idx_mm = np.memmap(idx_path, dtype="int32", mode="r", shape=(n_sample, seq_len, top_k))
     vals_mm = np.memmap(vals_path, dtype="float32", mode="r", shape=(n_sample, seq_len, top_k))
 
-    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    vocab_size = len(tokenizer)
     total_counts = _count_all_token_ids(ids_mm, vocab_size=vocab_size, chunk_samples=chunk_samples)
+
+    device = next(model_base.model.parameters()).device
 
     # Load precomputed attributes
     ratios = torch.load(
@@ -117,37 +112,11 @@ def describe_features(
         os.path.join(sae_dir, "attribute", "activation_value", "stats.pt"), map_location="cpu"
     )
     output_sens = torch.load(
-        os.path.join(sae_dir, "attribute", "output_sensitivity", "sensitivity.pt"), map_location="cpu"
+        os.path.join(sae_dir, "attribute", "output_sensitivity", "sensitivity.pt"), map_location="cpu", weights_only=False
     )
-
-    # Register hooks
-    embed_module = model_base._get_model_embed_modules()
-    embed_module.weight.requires_grad_(True)
-
-    residual_in: Dict[str, torch.Tensor] = {}
-
-    def pre_hook_resid(module, inputs):
-        residual_in["value"] = inputs[0]
-
-    hook_handle = model_base.model_block_modules[int(sae_base.layer)].register_forward_pre_hook(
-        pre_hook_resid
-    )
-
-    embed_out: Dict[str, torch.Tensor] = {}
-
-    def hook_embed(module, inputs, output):
-        embed_out["value"] = output
-        output.retain_grad()
-
-    embed_handle = embed_module.register_forward_hook(hook_embed)
 
     norm = model_base._get_model_norm_modules()
     lm_head = model_base._get_model_lm_head().weight
-
-    pad_id = tokenizer.pad_token_id
-    bos_id = tokenizer.bos_token_id
-    eos_id = tokenizer.eos_token_id
-    device = embed_module.weight.device
 
     out_root = os.path.join(sae_dir, "description")
     os.makedirs(out_root, exist_ok=True)
@@ -182,9 +151,10 @@ def describe_features(
                 + "\n"
             )
 
-        act_counts = np.zeros((vocab_size,), dtype=np.int64)
+        full_vocab_size = len(tokenizer)
+        act_counts = np.zeros((full_vocab_size,), dtype=np.int64)
         active_total = 0
-        heap: List[Tuple[float, int]] = []
+        heap: List[Tuple[float, int]] = []  # (avg_activation, sample_idx)
 
         for s0 in range(0, n_sample, chunk_samples):
             s1 = min(s0 + chunk_samples, n_sample)
@@ -192,39 +162,36 @@ def describe_features(
             idx_chunk = np.asarray(idx_mm[s0:s1], dtype=np.int64)
             vals_chunk = np.asarray(vals_mm[s0:s1], dtype=np.float32)
 
-            mask = idx_chunk == feature_idx
-            any_mask = mask.any(axis=-1)
+            mask = idx_chunk == feature_idx  # (chunk, seq_len, top_k)
+            any_mask_pos = mask.any(axis=-1)   # (chunk, seq_len)
+            any_mask_sample = any_mask_pos.any(axis=-1)  # (chunk,)
 
-            if not np.any(any_mask):
+            if not np.any(any_mask_sample):
                 continue
 
-            active_total += int(any_mask.sum())
+            active_total += int(any_mask_pos.sum())
 
-            tok_ids = ids_chunk[any_mask].reshape(-1)
-            valid = (tok_ids >= 0) & (tok_ids < vocab_size)
+            tok_ids = ids_chunk[any_mask_pos].reshape(-1)
+            valid = (tok_ids >= 0) & (tok_ids < full_vocab_size)
             if np.any(valid):
-                act_counts += np.bincount(tok_ids[valid], minlength=vocab_size)
+                act_counts += np.bincount(tok_ids[valid], minlength=full_vocab_size)
 
-            feat_vals_pos = (vals_chunk * mask).sum(axis=-1)
-            flat_vals = feat_vals_pos[any_mask].astype(np.float32, copy=False)
-            flat_local = np.flatnonzero(any_mask)
+            # Per-sample average activation (non-activated positions count as 0)
+            feat_vals_pos = (vals_chunk * mask).sum(axis=-1)  # (chunk, seq_len)
+            sample_avg = feat_vals_pos.mean(axis=-1)  # (chunk,)
 
-            local_sample = (flat_local // seq_len).astype(np.int64)
-            local_pos = (flat_local % seq_len).astype(np.int64)
-            global_flat = (s0 + local_sample) * seq_len + local_pos
-
-            for v, gi in zip(flat_vals.tolist(), global_flat.tolist()):
+            for local_idx in np.flatnonzero(any_mask_sample).tolist():
+                global_idx = s0 + int(local_idx)
+                avg = float(sample_avg[local_idx])
                 if len(heap) < text_k:
-                    heapq.heappush(heap, (float(v), int(gi)))
-                elif float(v) > heap[0][0]:
-                    heapq.heapreplace(heap, (float(v), int(gi)))
+                    heapq.heappush(heap, (avg, global_idx))
+                elif avg > heap[0][0]:
+                    heapq.heapreplace(heap, (avg, global_idx))
 
         with open(token_out_path, "a", encoding="utf-8") as f:
             f.write(f"activate / total: {active_total} / {total_positions}\n")
             entries = []
             for token_id in np.nonzero(act_counts)[0].tolist():
-                if token_id in (bos_id, eos_id, pad_id):
-                    continue
                 tok = tokenizer.convert_ids_to_tokens([int(token_id)])[0]
                 entries.append(
                     {
@@ -247,78 +214,22 @@ def describe_features(
 
         heap_sorted = sorted(heap, key=lambda x: x[0], reverse=True)
 
-        for act_val, global_flat in heap_sorted:
-            sample_idx = int(global_flat // seq_len)
-            pos_idx = int(global_flat % seq_len)
+        with open(topk_out_path, "a", encoding="utf-8") as f:
+            for avg_act, sample_idx in heap_sorted:
+                full_ids = np.asarray(ids_mm[sample_idx, :], dtype=np.int64)
+                full_idx = np.asarray(idx_mm[sample_idx, :, :], dtype=np.int64)
 
-            start = max(0, pos_idx - context_window_forward)
-            end = min(seq_len, pos_idx + context_window_backward)
-            window_ids = np.asarray(ids_mm[sample_idx, start:end], dtype=np.int64)
+                tokens = tokenizer.convert_ids_to_tokens(full_ids.tolist())
+                for t in range(seq_len):
+                    if np.any(full_idx[t] == feature_idx):
+                        tokens[t] = f"[{tokens[t]}]"
 
-            prefix_ids_np = np.asarray(ids_mm[sample_idx, : pos_idx + 1], dtype=np.int64)
-            prefix_ids = (
-                torch.from_numpy(prefix_ids_np).to(device=device, dtype=torch.long).unsqueeze(0)
-            )
-            attention_mask = _make_left_padding_attention_mask(prefix_ids, pad_id=pad_id).to(device)
-
-            residual_in.clear()
-            embed_out.clear()
-            model_base.model.zero_grad(set_to_none=True)
-
-            with torch.enable_grad():
-                _ = model_base.model(input_ids=prefix_ids, attention_mask=attention_mask)
-                acts = residual_in["value"]
-                feat_bt = sae_base.encode(acts)[0][:, :, feature_idx]
-                feat_bt[0, pos_idx].backward(retain_graph=False)
-                token_grads = embed_out["value"].grad[0]
-                grad_norms = token_grads.to(dtype=torch.float32).norm(dim=-1).detach().cpu().numpy()
-
-            window_grad_norms = grad_norms[start : pos_idx + 1]
-            tokens = tokenizer.convert_ids_to_tokens(window_ids.tolist())
-
-            if window_grad_norms.size > 0:
-                topg_k = min(top_grad_k, window_grad_norms.size)
-                topg_local_idx = window_grad_norms.argsort()[-topg_k:][::-1]
-            else:
-                topg_local_idx = np.array([], dtype=np.int64)
-
-            topg_tokens = [
-                tokens[int(j)] for j in topg_local_idx.tolist() if 0 <= int(j) < len(tokens)
-            ]
-            for j in topg_local_idx.tolist():
-                if 0 <= int(j) < len(tokens):
-                    tokens[int(j)] = f"[{tokens[int(j)]}]"
-            relative_pos = pos_idx - start
-            if 0 <= relative_pos < len(tokens):
-                tokens[relative_pos] = f"[TOKEN: {tokens[relative_pos]}]"
-
-            context_text = tokenizer.convert_tokens_to_string(tokens)
-            entry_json = {
-                "text": context_text,
-                "activation": float(act_val),
-                "top_grad_tokens": [
-                    {"token": tok, "grad": float(window_grad_norms[int(j)])}
-                    for tok, j in zip(topg_tokens, topg_local_idx.tolist())
-                ],
-            }
-
-            top_lines = ["["]
-            for item in entry_json["top_grad_tokens"]:
-                line = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-                top_lines.append("  " + line + ",")
-            if len(top_lines) > 1:
-                top_lines[-1] = top_lines[-1].rstrip(",")
-            top_lines.append("]")
-            top_block = "\n".join(top_lines)
-
-            json_pretty = json.dumps(entry_json, ensure_ascii=False, indent=2)
-            json_final = re.sub(
-                r'"top_grad_tokens": \[[\s\S]*?\]',
-                f'"top_grad_tokens": {top_block}',
-                json_pretty,
-            )
-            with open(topk_out_path, "a", encoding="utf-8") as f:
-                f.write(json_final + "\n")
+                text = tokenizer.convert_tokens_to_string(tokens)
+                entry = {
+                    "avg_activation": float(avg_act),
+                    "text": text,
+                }
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         # ---- decoder_entropy.json ----
         decoder_vec = sae_base.sae["W_dec"][feature_idx : feature_idx + 1, :]
@@ -376,8 +287,5 @@ def describe_features(
             f"output sensitivity(mean) {mean_sens:.6f}"
         )
         result[feature_idx] = feature_dir
-
-    hook_handle.remove()
-    embed_handle.remove()
 
     return result

@@ -26,11 +26,32 @@ def compute_entropy(
     sae_name = sae_base.sae_name
     layer = sae_base.layer
 
-    llm_dir = os.path.join("./data", model_name)
-    sae_dir = os.path.join(llm_dir, sae_name, f"layer-{layer}")
+    llm_dir = os.path.join("./data", model_name, sae_name)
+    sae_dir = os.path.join(llm_dir, f"layer-{layer}")
 
     save_dir = os.path.join(sae_dir, "attribute", "entropy")
     os.makedirs(save_dir, exist_ok=True)
+    entropy_path = os.path.join(save_dir, "entropy.pt")
+
+    if os.path.exists(entropy_path):
+        ent_np = torch.load(entropy_path, weights_only=False).numpy()
+        bins = np.arange(0.0, 12.1, 1.0)
+        fig_path = os.path.join(save_dir, "entropy_bar.png")
+        plot_binned_proportion_bar(
+            data=ent_np,
+            bins=bins,
+            save_path=fig_path,
+            title="Entropy Distribution",
+            xlabel="Entropy Interval",
+            ylabel="Proportion of Features",
+            descending=True,
+            rotate_xticks=45,
+        )
+        return {
+            "save_dir": save_dir,
+            "entropy_pt": entropy_path,
+            "fig": fig_path,
+        }
 
     # Model components
     norm = model_base._get_model_norm_modules()

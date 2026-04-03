@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 
 from utils.hf_models.model_base import ModelBase
 from utils.sae.sae_base import SAEBase
-from utils.paint import plot_binned_proportion_bar
+from utils.paint import plot_binned_proportion_bar, plot_1d_distribution_hist
 
 from .functional_token import _load_token_flag_lookup, _ensure_token_flag_map
 
@@ -37,8 +37,57 @@ def compute_functional_ratio(
     top_k = sae_base.top_k
     n_feat = sae_base.sae_dim
 
-    llm_dir = os.path.join("./data", model_name)
-    sae_dir = os.path.join(llm_dir, sae_name, f"layer-{layer}")
+    llm_dir = os.path.join("./data", model_name, sae_name)
+    sae_dir = os.path.join(llm_dir, f"layer-{layer}")
+
+    save_dir = os.path.join(sae_dir, "attribute", "functional_ratio")
+    counts_pt_path = os.path.join(save_dir, "counts.pt")
+    ratios_pt_path = os.path.join(save_dir, "ratios.pt")
+
+    try:
+        total_count = torch.load(counts_pt_path, weights_only=False).numpy()
+        ratios = torch.load(ratios_pt_path, weights_only=False).numpy()
+    except FileNotFoundError:
+        pass
+    else:
+        nonzero = total_count > 0
+
+        meta_path = os.path.join(llm_dir, "meta.json")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        total_tokens = int(meta["n_sample"]) * int(meta["seq_len"])
+
+        bins = np.arange(0.0, 1.1, 0.1)
+        fig_path = os.path.join(save_dir, "ratio_bar.png")
+        plot_binned_proportion_bar(
+            data=ratios,
+            mask=nonzero,
+            bins=bins,
+            save_path=fig_path,
+            title="Functional Ratio Distribution",
+            xlabel="Ratio Interval",
+            ylabel="Proportion of Features",
+            descending=True,
+            rotate_xticks=45,
+        )
+
+        counts_fig_path = os.path.join(save_dir, "counts_rate_hist.png")
+        activation_rate = total_count / total_tokens
+        plot_1d_distribution_hist(
+            data=activation_rate,
+            save_path=counts_fig_path,
+            title="Feature Activation Rate Distribution",
+            xlabel="Activation Rate (activations / total tokens)",
+            ylabel="Number of Features",
+        )
+
+        return {
+            "save_dir": save_dir,
+            "counts_pt": counts_pt_path,
+            "ratios_pt": ratios_pt_path,
+            "figure": fig_path,
+            "counts_figure": counts_fig_path,
+        }
 
     meta_path = os.path.join(llm_dir, "meta.json")
     if not os.path.exists(meta_path):
@@ -61,7 +110,6 @@ def compute_functional_ratio(
     ids_mm = np.memmap(ids_path, dtype="int32", mode="r", shape=(n_sample, seq_len))
     idx_mm = np.memmap(idx_path, dtype="int32", mode="r", shape=(n_sample, seq_len, top_k))
 
-    save_dir = os.path.join(sae_dir, "attribute", "functional_ratio")
     os.makedirs(save_dir, exist_ok=True)
 
     # Ensure token_flag_map.json exists in save_dir (generate if needed)
@@ -75,10 +123,6 @@ def compute_functional_ratio(
     # Token flags (dense lookup)
     lookup = _load_token_flag_lookup(model_base.tokenizer, token_flag_map_path)
 
-    bos_id = model_base.tokenizer.bos_token_id
-    eos_id = model_base.tokenizer.eos_token_id
-    pad_id = model_base.tokenizer.pad_token_id
-
     total_count = np.zeros((n_feat,), dtype=np.int64)
     flag1_count = np.zeros((n_feat,), dtype=np.int64)
 
@@ -89,24 +133,15 @@ def compute_functional_ratio(
         ids = np.asarray(ids_mm[start:end])  # (B, L)
         idx = np.asarray(idx_mm[start:end])  # (B, L, K)
 
-        # Valid tokens (exclude special)
-        valid_tok = np.ones_like(ids, dtype=bool)
-        if bos_id is not None:
-            valid_tok &= (ids != int(bos_id))
-        if eos_id is not None:
-            valid_tok &= (ids != int(eos_id))
-        if pad_id is not None:
-            valid_tok &= (ids != int(pad_id))
-
         # token flags (0/1), unknown ids default to 0
         ids_clip = ids.copy()
         ids_clip[ids_clip < 0] = 0
         ids_clip[ids_clip >= lookup.shape[0]] = 0
         flags = lookup[ids_clip]  # (B, L) uint8
-        flags = (flags == 1) & valid_tok
+        flags = (flags == 1)
 
-        # feature validity mask (idx >= 0) and token validity
-        valid_feat = (idx >= 0) & valid_tok[..., None]
+        # feature validity mask (idx >= 0 only)
+        valid_feat = (idx >= 0)
 
         # total counts
         if valid_feat.any():
@@ -130,6 +165,8 @@ def compute_functional_ratio(
     torch.save(torch.from_numpy(total_count), counts_pt_path)
     torch.save(torch.from_numpy(ratios), ratios_pt_path)
 
+    total_tokens = n_sample * seq_len
+
     bins = np.arange(0.0, 1.1, 0.1)
     fig_path = os.path.join(save_dir, "ratio_bar.png")
     plot_binned_proportion_bar(
@@ -142,13 +179,24 @@ def compute_functional_ratio(
         ylabel="Proportion of Features",
         descending=True,
         rotate_xticks=45,
-   )
+    )
+
+    counts_fig_path = os.path.join(save_dir, "counts_rate_hist.png")
+    activation_rate = total_count / total_tokens
+    plot_1d_distribution_hist(
+        data=activation_rate,
+        save_path=counts_fig_path,
+        title="Feature Activation Rate Distribution",
+        xlabel="Activation Rate (activations / total tokens)",
+        ylabel="Number of Features",
+    )
 
     return {
         "save_dir": save_dir,
         "counts_pt": counts_pt_path,
         "ratios_pt": ratios_pt_path,
         "figure": fig_path,
+        "counts_figure": counts_fig_path,
     }
 
 
@@ -165,4 +213,5 @@ def run(
     print(f"[functional_ratio] counts: {out['counts_pt']}")
     print(f"[functional_ratio] ratios: {out['ratios_pt']}")
     print(f"[functional_ratio] fig:    {out['figure']}")
+    print(f"[functional_ratio] counts_fig: {out['counts_figure']}")
     return out

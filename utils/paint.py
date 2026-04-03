@@ -55,7 +55,7 @@ def plot_1d_distribution_hist(
     if x.size == 0:
         raise ValueError("plot_1d_distribution_hist: `data` has no finite values to plot.")
 
-    # optional clipping for better visualization (keeps stats consistent with clipped data if enabled)
+    # optional clipping for better visualization
     if clip_percentile is not None:
         lo_p, hi_p = clip_percentile
         lo = np.percentile(x, lo_p)
@@ -70,76 +70,97 @@ def plot_1d_distribution_hist(
     }
 
     # ---- Style defaults (matplotlib-only, clean academic look) ----
-    # Histogram (neutral) + stat lines (distinct, harmonious)
-    hist_color = "#9AA0A6"   # neutral gray
-    edge_color = "#FFFFFF"   # white edges to look crisp
+    hist_color = "#1a1a1a"   # near-black bars
+    edge_color = "#444444"   # dark edges
     mean_color = "#1F77B4"   # blue
     min_color  = "#2CA02C"   # green
     max_color  = "#D62728"   # red
 
-    fig = plt.figure(figsize=figsize)
-    ax = plt.gca()
+    p90 = float(np.percentile(x, 90))
+    p95 = float(np.percentile(x, 95))
+    pct_lines = [(90, p90, "#F58518"), (95, p95, "#72B7B2")]
 
-    # Histogram
-    ax.hist(
-        x,
-        bins=bins,
-        color=hist_color,
-        alpha=0.85,
-        edgecolor=edge_color,
-        linewidth=0.6,
-    )
+    fig, (ax, ax_log) = plt.subplots(2, 1, figsize=(figsize[0], figsize[1] * 1.8))
 
-    # Stats lines
-    if show_stats:
-        ax.axvline(
-            stats["mean"],
-            linewidth=2.2,
-            color=mean_color,
-            label=f"mean={stats['mean']:.{stat_precision}f}",
-            zorder=3,
-        )
-        ax.axvline(
-            stats["min"],
-            linewidth=2.0,
-            color=min_color,
-            label=f"min={stats['min']:.{stat_precision}f}",
-            zorder=3,
-        )
-        ax.axvline(
-            stats["max"],
-            linewidth=2.0,
-            color=max_color,
-            label=f"max={stats['max']:.{stat_precision}f}",
-            zorder=3,
+    def _draw_hist(ax, log_scale=False):
+        counts_arr, bin_edges_arr, _ = ax.hist(
+            x,
+            bins=bins,
+            color=hist_color,
+            alpha=0.85,
+            edgecolor=edge_color,
+            linewidth=0.6,
+            zorder=2,
+            log=log_scale,
         )
 
-    # Labels & title
-    ax.set_title(title, fontsize=12, pad=10)
-    ax.set_xlabel(xlabel, fontsize=11)
-    ax.set_ylabel(ylabel, fontsize=11)
+        if show_stats:
+            import matplotlib.patches as mpatches
+            stat_entries = [
+                (stats["mean"], mean_color, "mean"),
+                (stats["min"],  min_color,  "min"),
+                (stats["max"],  max_color,  "max"),
+            ]
+            legend_handles = []
+            for val, color, key in stat_entries:
+                ax.axvline(val, color=color, alpha=0.45, linewidth=3, zorder=1)
+                legend_handles.append(
+                    mpatches.Patch(
+                        color=color, alpha=0.7,
+                        label=f"{key} = {val:.{stat_precision}f}",
+                    )
+                )
+            ax.legend(handles=legend_handles, fontsize=8, loc="center right",
+                      framealpha=0.7, edgecolor="#cccccc")
 
-    # Even-ish ticks
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=x_ticks))
-    ax.yaxis.set_major_locator(MaxNLocator(nbins=y_ticks))
+        suffix = " (log scale)" if log_scale else ""
+        ax.set_title(title + suffix, fontsize=12, pad=10)
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
 
-    # Grid (subtle)
-    if grid:
-        ax.grid(True, which="major", axis="both", linewidth=0.6, alpha=0.25)
-        ax.set_axisbelow(True)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=x_ticks))
+        if not log_scale:
+            ax.yaxis.set_major_locator(MaxNLocator(nbins=y_ticks))
 
-    # Cleaner spines
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+        if grid:
+            ax.grid(True, which="major", axis="both", linewidth=0.6, alpha=0.25)
+            ax.set_axisbelow(True)
 
-    # Legend
-    if show_stats:
-        ax.legend(frameon=False, fontsize=10, loc="best")
+        ax.spines["top"].set_visible(False)
+
+        # ---- CDF on twin right axis ----
+        cum = np.cumsum(counts_arr) / counts_arr.sum()
+        cdf_x = np.concatenate([[bin_edges_arr[0]], bin_edges_arr[1:]])
+        cdf_y = np.concatenate([[0.0], cum])
+        ax2 = ax.twinx()
+        ax2.plot(cdf_x, cdf_y, color="#E45756", linewidth=1.5, zorder=3)
+        ax2.set_ylabel("CDF", fontsize=10, color="#E45756")
+        ax2.tick_params(axis="y", labelcolor="#E45756", labelsize=8)
+        ax2.set_ylim(0.7, 1.02)
+        ax2.yaxis.set_major_locator(MaxNLocator(nbins=6))
+        ax2.spines["top"].set_visible(False)
+
+        # ---- percentile lines + annotations ----
+        xform = ax.get_xaxis_transform()  # x: data coords, y: axes fraction
+        y2_min, y2_max = ax2.get_ylim()
+        for pct, val, color in pct_lines:
+            ax.axvline(val, color=color, linestyle="--", linewidth=1.2, alpha=0.85, zorder=4)
+            ax2.axhline(pct / 100, color=color, linestyle=":", linewidth=0.8, alpha=0.5)
+            # convert ax2 data coord to axes fraction so text sits on the horizontal line
+            y_frac = (pct / 100 - y2_min) / (y2_max - y2_min)
+            ax.text(
+                val, y_frac, f"p{pct}={val:.4g}",
+                transform=xform, color=color,
+                fontsize=8, va="bottom", ha="left", rotation=0,
+            )
+
+    _draw_hist(ax, log_scale=False)
+    _draw_hist(ax_log, log_scale=True)
 
     plt.tight_layout()
 
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-    plt.savefig(save_path, dpi=dpi)
+    plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
     return stats

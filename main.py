@@ -10,7 +10,7 @@ import attribute.activation_length.main as activation_length
 import attribute.activation_value.main as activation_value
 import attribute.output_sensitivity.main as output_sensitivity
 
-from dataset.load import load_fineweb_text_to_cache
+from dataset.load import load_mixed_text_to_cache
 
 from utils.hf_models.model_factory import construct_model_base
 from utils.utils import model_alias_to_model_name
@@ -26,9 +26,13 @@ def Args():
     
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dtype", type=str, default="float16")
-    parser.add_argument("--normalize_acts", action="store_true")
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--layer", type=int, default=30)
+    parser.add_argument("--norm_factor", type=float, default=None,
+                        help="Activation norm factor; defaults to sqrt(d) if not set")
+    parser.add_argument("--second_dataset", type=str, default="beavertails",
+                        choices=["beavertails", "when2call"],
+                        help="Second dataset to mix with FineWeb (default: beavertails)")
 
     return parser.parse_args()
 
@@ -43,30 +47,46 @@ if __name__ == "__main__":
         model_path = args.model_path
     else:
         model_path = model_alias_to_model_name[model_alias]
-    model_base = construct_model_base(model_path, model_name)
+
+    selected_eval = [
+        "functional_ratio",
+        "entropy",
+        "activation_length",
+        "activation_value",
+        "output_sensitivity",
+    ]
+
+    print("=" * 60)
+    print("Experiment Configuration")
+    print("=" * 60)
+    print(f"  Model       : {model_name}")
+    print(f"  Model path  : {model_path}")
+    print(f"  Device      : {args.device}  |  dtype: {args.dtype}")
+    print(f"  SAE name    : {args.sae_name}")
+    print(f"  SAE path    : {args.sae_path}")
+    print(f"  Layer       : {args.layer}")
+    print(f"  Top-K       : {args.top_k}")
+    print(f"  Norm factor : {args.norm_factor}")
+    print(f"  Evals       : {selected_eval}")
+    print(f"  2nd dataset : {args.second_dataset}")
+    print("=" * 60)
+
+    model_base = construct_model_base(model_path, model_name, device=args.device)
 
     # Load SAE
     sae_cfg = {
         "device": args.device,
-        "normalize_acts": args.normalize_acts,
         "top_k": args.top_k,
         "layer": args.layer,
         "name": args.sae_name,
-        "dtype": args.dtype
+        "dtype": args.dtype,
+        "norm_factor": args.norm_factor,
     }
     sae_base = SAEBase(args.sae_path, **sae_cfg)
 
     # Get text activation on all layers
-    texts = load_fineweb_text_to_cache(model_base, n_sample=1e5)
+    texts = load_mixed_text_to_cache(model_base, n_sample=1e5, second_dataset=args.second_dataset)
     get_activation(model_base, sae_base, texts, batch_size=64, seq_len=128)
-
-    selected_eval = [
-        # "functional_ratio",
-        # "entropy",
-        # "activation_length",
-        # "activation_value",
-        "output_sensitivity",
-    ]
 
     if "functional_ratio" in selected_eval:
         functional_ratio.run(
@@ -96,6 +116,7 @@ if __name__ == "__main__":
         output_sensitivity.run(
             model_base=model_base,
             sae_base=sae_base,
+            chunk_samples=16
         )
 
 

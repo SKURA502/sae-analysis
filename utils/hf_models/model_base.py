@@ -6,11 +6,12 @@ from abc import ABC, abstractmethod
 
 class ModelBase(ABC):
 
-    def __init__(self, model_path, model_name):
+    def __init__(self, model_path, model_name, device: str = "cuda:0"):
         self.model_path = model_path
         self.model_name = model_name
+        self.device = device
 
-        self.model: AutoModelForCausalLM = self._load_model(model_path)
+        self.model: AutoModelForCausalLM = self._load_model(model_path, device=device)
 
         self.tokenizer: AutoTokenizer = self._load_tokenizer(model_path)
         
@@ -27,7 +28,7 @@ class ModelBase(ABC):
             del self.model
     
     @abstractmethod
-    def _load_model(self, model_path, dtype):
+    def _load_model(self, model_path, dtype=None, device: str = "cuda:0"):
         pass
 
     @abstractmethod

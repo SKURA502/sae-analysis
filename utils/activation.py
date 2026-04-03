@@ -86,7 +86,7 @@ def compute_activation(model_base: ModelBase, prompts: List[str], batch_size: in
         seq_len=seq_len,
         layers=layers,
         batch_size=batch_size,
-        save_device='cuda',
+        save_device=model_base.model.device,
         verbose=False
     )
     activations: Float[Tensor, 'n n_layers seq_len d_model'] = activations.cpu()
@@ -103,8 +103,8 @@ def get_activation(model_base: ModelBase, sae_base: SAEBase, prompts: List[str],
 
     print('shape act size', (n_sample, n_layers, seq_len, d_model))
 
-    foldername = f"./data/{model_base.model_name}"
-    sae_foldername = os.path.join(foldername, f"{sae_base.sae_name}/layer-{sae_base.layer}")
+    foldername = f"./data/{model_base.model_name}/{sae_base.sae_name}"
+    sae_foldername = os.path.join(foldername, f"layer-{sae_base.layer}")
     if os.path.exists(sae_foldername):
         print(f"[Cache hit] Found existing sae activations at {sae_foldername}")
         return
